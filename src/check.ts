@@ -1,5 +1,6 @@
 import { ConfigError, readConfig } from './config.js';
 import { createModelClient } from './model-client.js';
+import { initTracing, shutdownTracing } from './tracing.js';
 import { createTokenProvider } from './yandex-auth.js';
 
 /**
@@ -23,6 +24,7 @@ async function main(): Promise<void> {
     }
 
     console.log('\n1. Получение IAM-токена');
+    initTracing(config.tracing);
     const tokens = createTokenProvider(config.auth);
     const started = Date.now();
     const token = await tokens.getToken();
@@ -42,18 +44,20 @@ async function main(): Promise<void> {
     console.log(`   модель: ${model.modelUri}`);
 
     const answerStarted = Date.now();
-    const message = await model.complete(
+    const reply = await model.complete(
         [
             { role: 'system', content: 'Отвечай одним словом по-русски.' },
             { role: 'user', content: 'Скажи слово: готово' },
         ],
         [],
     );
-    console.log(`   ответ за ${Date.now() - answerStarted} мс: ${JSON.stringify(message.content)}`);
+    console.log(`   ответ за ${Date.now() - answerStarted} мс (${reply.usage.prompt}→${reply.usage.completion} ток.): ${JSON.stringify(reply.message.content)}`);
     console.log('\nНастройка работает.\n');
 }
 
-main().catch((error: unknown) => {
+main()
+    .finally(shutdownTracing)
+    .catch((error: unknown) => {
     console.error(`\n${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
 });

@@ -1,3 +1,4 @@
+import { SpanStatusCode } from '@opentelemetry/api';
 import OpenAI from 'openai';
 import type {
     ChatCompletionMessage,
@@ -5,6 +6,9 @@ import type {
     ChatCompletionTool,
 } from 'openai/resources/chat/completions';
 import { buildModelUri, type AppConfig } from './config.js';
+import { withRetry } from './retry.js';
+import { chatRequestAttributes, chatResponseAttributes } from './tracing-attributes.js';
+import { tracer } from './tracing.js';
 import type { TokenProvider } from './yandex-auth.js';
 
 export class ModelError extends Error {
@@ -14,15 +18,23 @@ export class ModelError extends Error {
     }
 }
 
+/** Расход токенов на одно обращение. Провайдер возвращает его в поле `usage`. */
+export type TokenUsage = { readonly prompt: number; readonly completion: number };
+
+export type ModelReply = {
+    readonly message: ChatCompletionMessage;
+    readonly usage: TokenUsage;
+};
+
 export type ModelClient = {
     /** URI модели в форме gpt://<folder>/<model> — показывается в интерфейсе. */
     readonly modelUri: string;
-    /** Одно обращение к модели. Возвращает сообщение целиком: текст либо требования вызовов. */
+    /** Одно обращение к модели: текст либо требования вызовов, плюс расход токенов. */
     complete(
         messages: readonly ChatCompletionMessageParam[],
         tools: readonly ChatCompletionTool[],
         signal?: AbortSignal,
-    ): Promise<ChatCompletionMessage>;
+    ): Promise<ModelReply>;
 };
 
 /**
@@ -44,37 +56,93 @@ export function createModelClient(config: AppConfig, tokens: TokenProvider): Mod
     return {
         modelUri,
 
-        async complete(messages, tools, signal): Promise<ChatCompletionMessage> {
-            const token = await tokens.getToken();
+        async complete(messages, tools, signal): Promise<ModelReply> {
+            // Спан `chat` — одно обращение к модели. Имена атрибутов взяты из семантических
+            // соглашений OpenTelemetry для GenAI, поэтому Langfuse и подобные бэкенды
+            // распознают их сами, без настройки сопоставления.
+            const span = tracer().startSpan(`chat ${config.model}`, {
+                attributes: chatRequestAttributes(
+                    config.model,
+                    modelUri,
+                    config.temperature,
+                    messages,
+                    tools,
+                    config.tracing.captureContent,
+                ),
+            });
 
-            let response;
             try {
-                response = await client.chat.completions.create(
-                    {
-                        model: modelUri,
-                        messages: messages as ChatCompletionMessageParam[],
-                        temperature: config.temperature,
-                        ...(tools.length > 0 ? { tools: tools as ChatCompletionTool[] } : {}),
-                    },
-                    {
-                        headers: { Authorization: `Bearer ${token}` },
-                        ...(signal === undefined ? {} : { signal }),
-                    },
+                const reply = await callModel(messages, tools, signal);
+                span.setAttributes(
+                    chatResponseAttributes(
+                        reply.message,
+                        reply.usage.prompt,
+                        reply.usage.completion,
+                        config.tracing.captureContent,
+                    ),
                 );
-            } catch (cause) {
-                if (cause instanceof Error && cause.name === 'AbortError') {
-                    throw cause;
-                }
-                throw new ModelError(describeFailure(cause), { cause });
+                return reply;
+            } catch (error) {
+                span.recordException(error as Error);
+                span.setStatus({
+                    code: SpanStatusCode.ERROR,
+                    message: error instanceof Error ? error.message : String(error),
+                });
+                throw error;
+            } finally {
+                span.end();
             }
-
-            const choice = response.choices[0];
-            if (choice === undefined) {
-                throw new ModelError('Модель вернула ответ без вариантов (choices пуст)');
-            }
-            return choice.message;
         },
     };
+
+    async function callModel(
+        messages: readonly ChatCompletionMessageParam[],
+        tools: readonly ChatCompletionTool[],
+        signal: AbortSignal | undefined,
+    ): Promise<ModelReply> {
+        const token = await tokens.getToken();
+
+        let response;
+        try {
+            response = await withRetry(
+                () =>
+                    client.chat.completions.create(
+                        {
+                            model: modelUri,
+                            messages: messages as ChatCompletionMessageParam[],
+                            temperature: config.temperature,
+                            ...(tools.length > 0 ? { tools: tools as ChatCompletionTool[] } : {}),
+                        },
+                        {
+                            headers: { Authorization: `Bearer ${token}` },
+                            ...(signal === undefined ? {} : { signal }),
+                        },
+                    ),
+                signal === undefined ? {} : { signal },
+            );
+        } catch (cause) {
+            if (
+                cause instanceof Error &&
+                (cause.name === 'AbortError' || cause.name === 'APIUserAbortError')
+            ) {
+                throw cause;
+            }
+            throw new ModelError(describeFailure(cause), { cause });
+        }
+
+        const choice = response.choices[0];
+        if (choice === undefined) {
+            throw new ModelError('Модель вернула ответ без вариантов (choices пуст)');
+        }
+
+        return {
+            message: choice.message,
+            usage: {
+                prompt: response.usage?.prompt_tokens ?? 0,
+                completion: response.usage?.completion_tokens ?? 0,
+            },
+        };
+    }
 }
 
 /**

@@ -3,6 +3,7 @@ import { ConfigError, readConfig, type AppConfig } from './config.js';
 import { createModelClient } from './model-client.js';
 import { tools } from './tools.js';
 import { App } from './ui/App.js';
+import { initTracing, shutdownTracing } from './tracing.js';
 import { createTokenProvider } from './yandex-auth.js';
 
 /**
@@ -27,12 +28,15 @@ function main(): void {
         throw error;
     }
 
+    initTracing(config.tracing);
+
     const tokens = createTokenProvider(config.auth);
     const model = createModelClient(config, tokens);
 
     printHeader(config, model.modelUri);
 
-    render(<App model={model} config={config} />);
+    const instance = render(<App model={model} config={config} />);
+    void instance.waitUntilExit().then(shutdownTracing);
 }
 
 function printHeader(config: AppConfig, modelUri: string): void {

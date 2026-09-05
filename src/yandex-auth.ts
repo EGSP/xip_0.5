@@ -1,5 +1,6 @@
 import { importPKCS8, SignJWT } from 'jose';
 import type { AuthConfig, ServiceAccountKey } from './config.js';
+import { describeCause, withRetry } from './retry.js';
 
 /** Эндпоинт обмена подписанного JWT на IAM-токен. */
 const IAM_TOKENS_URL = 'https://iam.api.cloud.yandex.net/iam/v1/tokens';
@@ -67,10 +68,20 @@ async function requestIamToken(key: ServiceAccountKey): Promise<IamToken> {
         .setExpirationTime(JWT_TTL)
         .sign(signingKey);
 
-    const response = await fetch(IAM_TOKENS_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jwt }),
+    const response = await withRetry(async () => {
+        try {
+            return await fetch(IAM_TOKENS_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ jwt }),
+            });
+        } catch (cause) {
+            throw new YandexAuthError(
+                `Не удалось обратиться к сервису IAM: ${cause instanceof Error ? cause.message : String(cause)}` +
+                    describeCause(cause),
+                { cause },
+            );
+        }
     });
 
     if (!response.ok) {

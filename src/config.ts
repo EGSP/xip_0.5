@@ -27,6 +27,22 @@ export type AuthConfig =
     | { readonly kind: 'static'; readonly token: string }
     | { readonly kind: 'serviceAccount'; readonly key: ServiceAccountKey };
 
+/**
+ * Настройки трассировки. Экспорт включается заданием адреса коллектора: пока он пуст,
+ * телеметрия никуда не отправляется и экспортёр не создаётся вовсе.
+ */
+export type TracingConfig = {
+    readonly enabled: boolean;
+    readonly endpoint: string;
+    readonly serviceName: string;
+    /**
+     * Записывать ли в спаны тексты запросов и ответов модели. Для учебного стенда это и есть
+     * главная польза трассировки, поэтому по умолчанию включено. В рабочей системе значение
+     * должно быть противоположным: иначе пользовательский ввод уходит в коллектор.
+     */
+    readonly captureContent: boolean;
+};
+
 export type AppConfig = {
     /** Значение YANDEX_MODEL как его задал пользователь (короткое имя или полный URI). */
     readonly model: string;
@@ -37,6 +53,7 @@ export type AppConfig = {
     readonly maxIterations: number;
     readonly temperature: number;
     readonly toolResultMaxChars: number;
+    readonly tracing: TracingConfig;
 };
 
 /**
@@ -132,6 +149,9 @@ export function readConfig(): AppConfig {
     }
 
     const baseUrlRaw = trimmed('YANDEX_BASE_URL');
+    const otlpEndpoint = trimmed('OTEL_EXPORTER_OTLP_ENDPOINT').replace(/\/+$/, '');
+    const serviceNameRaw = trimmed('OTEL_SERVICE_NAME');
+    const captureRaw = trimmed('OTEL_CAPTURE_CONTENT').toLowerCase();
 
     return {
         model,
@@ -141,6 +161,12 @@ export function readConfig(): AppConfig {
         maxIterations,
         temperature,
         toolResultMaxChars,
+        tracing: {
+            enabled: otlpEndpoint !== '',
+            endpoint: otlpEndpoint,
+            serviceName: serviceNameRaw === '' ? 'xip-0.5' : serviceNameRaw,
+            captureContent: captureRaw !== 'false' && captureRaw !== '0',
+        },
     };
 }
 

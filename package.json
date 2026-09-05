@@ -8,9 +8,17 @@
         "start": "tsx src/index.tsx",
         "check": "tsx src/check.ts",
         "typecheck": "tsc --noEmit",
-        "once": "tsx src/run-once.ts"
+        "once": "tsx src/run-once.ts",
+        "trace:up": "docker compose up -d",
+        "trace:down": "docker compose down"
     },
     "dependencies": {
+        "@opentelemetry/api": "^1.9.1",
+        "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
+        "@opentelemetry/exporter-trace-otlp-proto": "^0.222.0",
+        "@opentelemetry/resources": "^2.11.0",
+        "@opentelemetry/sdk-trace-node": "^2.11.0",
+        "@opentelemetry/semantic-conventions": "^1.43.0",
         "dotenv": "^17.4.2",
         "ink": "^7.1.1",
         "ink-spinner": "^5.0.0",

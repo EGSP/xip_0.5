@@ -1,12 +1,13 @@
-import { useCallback, useRef, useState, type ReactElement } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
 import { Box, Static, Text, useApp, useInput } from 'ink';
 import Spinner from 'ink-spinner';
 import TextInput from 'ink-text-input';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
-import { IterationLimitError, runTurn, SYSTEM_PROMPT, type TurnProgress } from '../agent-loop.js';
+import { IterationLimitError, runAgent, SYSTEM_PROMPT, type RunProgress } from '../agent-loop.js';
 import type { AppConfig } from '../config.js';
-import { ModelError, type ModelClient } from '../model-client.js';
-import { createSessionLog, type SessionEvent } from '../session-log.js';
+import { ModelError } from '../model-client.js';
+import { createSessionLog, type RunFailureReason, type SessionEvent } from '../session-log.js';
+import type { ModelClient } from '../model-client.js';
 import { EventLine } from './EventLine.js';
 
 export type AppProps = {
@@ -20,9 +21,10 @@ export function App({ model, config }: AppProps): ReactElement {
     const [events, setEvents] = useState<SessionEvent[]>([]);
     const [input, setInput] = useState('');
     const [busy, setBusy] = useState(false);
-    const [progress, setProgress] = useState<TurnProgress | undefined>(undefined);
+    const [progress, setProgress] = useState<RunProgress | undefined>(undefined);
+    const [elapsedMs, setElapsedMs] = useState(0);
 
-    // Массив сообщений живёт между ходами и не участвует в отрисовке, поэтому хранится
+    // Массив сообщений живёт между прогонами и не участвует в отрисовке, поэтому хранится
     // в ссылке, а не в состоянии: его изменение не должно вызывать перерисовку.
     const messagesRef = useRef<ChatCompletionMessageParam[]>([
         { role: 'system', content: SYSTEM_PROMPT },
@@ -35,6 +37,17 @@ export function App({ model, config }: AppProps): ReactElement {
     );
 
     const abortRef = useRef<AbortController | undefined>(undefined);
+
+    // Счётчик времени идёт только во время прогона: в покое перерисовывать нечего.
+    useEffect(() => {
+        if (!busy) {
+            setElapsedMs(0);
+            return;
+        }
+        const startedAt = Date.now();
+        const timer = setInterval(() => setElapsedMs(Date.now() - startedAt), 250);
+        return () => clearInterval(timer);
+    }, [busy]);
 
     useInput((_value, key) => {
         if (key.escape && abortRef.current !== undefined) {
@@ -63,17 +76,18 @@ export function App({ model, config }: AppProps): ReactElement {
             abortRef.current = controller;
 
             try {
-                await runTurn({
+                await runAgent({
                     model,
                     messages: messagesRef.current,
                     log,
                     maxIterations: config.maxIterations,
                     toolResultMaxChars: config.toolResultMaxChars,
+                    captureContent: config.tracing.captureContent,
                     onProgress: setProgress,
                     signal: controller.signal,
                 });
             } catch (error) {
-                log.append({ type: 'turn_failed', ...classify(error) });
+                log.append({ type: 'run_failed', ...classify(error) });
             } finally {
                 abortRef.current = undefined;
                 setProgress(undefined);
@@ -87,52 +101,71 @@ export function App({ model, config }: AppProps): ReactElement {
         <Box flexDirection="column">
             <Static items={events}>{(event) => <EventLine key={event.seq} event={event} />}</Static>
 
-            <Box marginTop={1}>
-                {busy ? (
-                    <Text color="yellow">
-                        <Spinner type="dots" />
-                        <Text>{` ${describeProgress(progress)}`}</Text>
-                        <Text dimColor>{'   Esc — прервать ход'}</Text>
-                    </Text>
-                ) : (
-                    <>
-                        <Text color="cyan" bold>
-                            {'› '}
+            <Box flexDirection="column" marginTop={1}>
+                <Box
+                    borderStyle="round"
+                    borderColor={busy ? 'yellow' : 'cyan'}
+                    paddingX={1}
+                    minHeight={3}
+                >
+                    {busy ? (
+                        <Text color="yellow">
+                            <Spinner type="dots" />
+                            <Text>{` ${describeProgress(progress)}`}</Text>
+                            <Text dimColor>{`  ·  ${(elapsedMs / 1000).toFixed(1)} с`}</Text>
                         </Text>
-                        <TextInput
-                            value={input}
-                            onChange={setInput}
-                            onSubmit={(value) => {
-                                void submit(value);
-                            }}
-                            placeholder="сообщение агенту (/exit — выход)"
-                        />
-                    </>
-                )}
+                    ) : (
+                        <>
+                            <Text color="cyan" bold>
+                                {'› '}
+                            </Text>
+                            <TextInput
+                                value={input}
+                                onChange={setInput}
+                                onSubmit={(value) => {
+                                    void submit(value);
+                                }}
+                                placeholder="сообщение агенту"
+                            />
+                        </>
+                    )}
+                </Box>
+
+                <Box paddingX={1}>
+                    <Text dimColor>
+                        {busy
+                            ? 'Esc — прервать прогон'
+                            : `${config.model}  ·  предел ${config.maxIterations} итер.  ·  /exit — выход`}
+                    </Text>
+                </Box>
             </Box>
         </Box>
     );
 }
 
-function describeProgress(progress: TurnProgress | undefined): string {
+function describeProgress(progress: RunProgress | undefined): string {
     if (progress === undefined) return 'подготовка';
-    if (progress.kind === 'model') {
-        return `шаг ${progress.step}/${progress.maxSteps} · обращение к модели`;
-    }
-    return `шаг ${progress.step}/${progress.maxSteps} · выполняется ${progress.name}`;
+    const position = `итерация ${progress.iteration}/${progress.maxIterations}`;
+    if (progress.kind === 'model') return `${position}  ·  обращение к модели`;
+    const batch =
+        progress.batchSize > 1 ? ` (${progress.batchIndex} из ${progress.batchSize})` : '';
+    return `${position}  ·  ${progress.name}${batch}`;
 }
 
 /**
- * Различает исходы неудачного хода. Сведённые в одно «ошибка», эти случаи требуют разной
- * реакции: предел шагов означает слишком крупную задачу, отказ модели — проблему на стороне
- * провайдера, отмена — намеренное действие пользователя.
+ * Различает исходы неудачного прогона. Сведённые в одно «ошибка», эти случаи требуют разной
+ * реакции: предел итераций означает слишком крупную задачу, отказ модели — проблему на
+ * стороне провайдера, отмена — намеренное действие пользователя.
  */
-function classify(error: unknown): { reason: FailureReason; message: string } {
+function classify(error: unknown): { reason: RunFailureReason; message: string } {
     if (error instanceof IterationLimitError) {
         return { reason: 'iteration_limit', message: error.message };
     }
-    if (error instanceof Error && (error.name === 'AbortError' || error.name === 'APIUserAbortError')) {
-        return { reason: 'aborted', message: 'Ход прерван пользователем.' };
+    if (
+        error instanceof Error &&
+        (error.name === 'AbortError' || error.name === 'APIUserAbortError')
+    ) {
+        return { reason: 'aborted', message: 'Прогон прерван по нажатию Esc.' };
     }
     if (error instanceof ModelError) {
         return { reason: 'model_error', message: error.message };
@@ -142,5 +175,3 @@ function classify(error: unknown): { reason: FailureReason; message: string } {
         message: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
     };
 }
-
-type FailureReason = 'model_error' | 'iteration_limit' | 'aborted' | 'internal';
