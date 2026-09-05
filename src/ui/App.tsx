@@ -3,10 +3,16 @@ import { Box, Static, Text, useApp, useInput } from 'ink';
 import Spinner from 'ink-spinner';
 import TextInput from 'ink-text-input';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
-import { IterationLimitError, runAgent, SYSTEM_PROMPT, type RunProgress } from '../agent-loop.js';
+import {
+    OutputLimitError,
+    StepLimitError,
+    runTurn,
+    SYSTEM_PROMPT,
+    type TurnProgress,
+} from '../agent-loop.js';
 import type { AppConfig } from '../config.js';
 import { ModelError } from '../model-client.js';
-import { createSessionLog, type RunFailureReason, type SessionEvent } from '../session-log.js';
+import { createSessionLog, type TurnFailureReason, type SessionEvent } from '../session-log.js';
 import type { ModelClient } from '../model-client.js';
 import { EventLine } from './EventLine.js';
 
@@ -21,10 +27,10 @@ export function App({ model, config }: AppProps): ReactElement {
     const [events, setEvents] = useState<SessionEvent[]>([]);
     const [input, setInput] = useState('');
     const [busy, setBusy] = useState(false);
-    const [progress, setProgress] = useState<RunProgress | undefined>(undefined);
+    const [progress, setProgress] = useState<TurnProgress | undefined>(undefined);
     const [elapsedMs, setElapsedMs] = useState(0);
 
-    // Массив сообщений живёт между прогонами и не участвует в отрисовке, поэтому хранится
+    // Массив сообщений живёт между ходами и не участвует в отрисовке, поэтому хранится
     // в ссылке, а не в состоянии: его изменение не должно вызывать перерисовку.
     const messagesRef = useRef<ChatCompletionMessageParam[]>([
         { role: 'system', content: SYSTEM_PROMPT },
@@ -38,7 +44,7 @@ export function App({ model, config }: AppProps): ReactElement {
 
     const abortRef = useRef<AbortController | undefined>(undefined);
 
-    // Счётчик времени идёт только во время прогона: в покое перерисовывать нечего.
+    // Счётчик времени идёт только во время хода: в покое перерисовывать нечего.
     useEffect(() => {
         if (!busy) {
             setElapsedMs(0);
@@ -76,25 +82,25 @@ export function App({ model, config }: AppProps): ReactElement {
             abortRef.current = controller;
 
             try {
-                await runAgent({
+                await runTurn({
                     model,
                     messages: messagesRef.current,
                     log,
-                    maxIterations: config.maxIterations,
+                    maxSteps: config.maxSteps,
                     toolResultMaxChars: config.toolResultMaxChars,
                     captureContent: config.tracing.captureContent,
                     onProgress: setProgress,
                     signal: controller.signal,
                 });
             } catch (error) {
-                log.append({ type: 'run_failed', ...classify(error) });
+                log.append({ type: 'turn_failed', ...classify(error) });
             } finally {
                 abortRef.current = undefined;
                 setProgress(undefined);
                 setBusy(false);
             }
         },
-        [busy, config.maxIterations, config.toolResultMaxChars, exit, model],
+        [busy, config.maxSteps, config.toolResultMaxChars, exit, model],
     );
 
     return (
@@ -134,8 +140,8 @@ export function App({ model, config }: AppProps): ReactElement {
                 <Box paddingX={1}>
                     <Text dimColor>
                         {busy
-                            ? 'Esc — прервать прогон'
-                            : `${config.model}  ·  предел ${config.maxIterations} итер.  ·  /exit — выход`}
+                            ? 'Esc — прервать ход'
+                            : `${config.model}  ·  предел ${config.maxSteps} шаг.  ·  /exit — выход`}
                     </Text>
                 </Box>
             </Box>
@@ -143,9 +149,9 @@ export function App({ model, config }: AppProps): ReactElement {
     );
 }
 
-function describeProgress(progress: RunProgress | undefined): string {
+function describeProgress(progress: TurnProgress | undefined): string {
     if (progress === undefined) return 'подготовка';
-    const position = `итерация ${progress.iteration}/${progress.maxIterations}`;
+    const position = `шаг ${progress.step}/${progress.maxSteps}`;
     if (progress.kind === 'model') return `${position}  ·  обращение к модели`;
     const batch =
         progress.batchSize > 1 ? ` (${progress.batchIndex} из ${progress.batchSize})` : '';
@@ -153,19 +159,22 @@ function describeProgress(progress: RunProgress | undefined): string {
 }
 
 /**
- * Различает исходы неудачного прогона. Сведённые в одно «ошибка», эти случаи требуют разной
- * реакции: предел итераций означает слишком крупную задачу, отказ модели — проблему на
+ * Различает исходы неудачного хода. Сведённые в одно «ошибка», эти случаи требуют разной
+ * реакции: предел шагов означает слишком крупную задачу, отказ модели — проблему на
  * стороне провайдера, отмена — намеренное действие пользователя.
  */
-function classify(error: unknown): { reason: RunFailureReason; message: string } {
-    if (error instanceof IterationLimitError) {
-        return { reason: 'iteration_limit', message: error.message };
+function classify(error: unknown): { reason: TurnFailureReason; message: string } {
+    if (error instanceof StepLimitError) {
+        return { reason: 'step_limit', message: error.message };
+    }
+    if (error instanceof OutputLimitError) {
+        return { reason: 'output_limit', message: error.message };
     }
     if (
         error instanceof Error &&
         (error.name === 'AbortError' || error.name === 'APIUserAbortError')
     ) {
-        return { reason: 'aborted', message: 'Прогон прерван по нажатию Esc.' };
+        return { reason: 'aborted', message: 'Ход прерван по нажатию Esc.' };
     }
     if (error instanceof ModelError) {
         return { reason: 'model_error', message: error.message };

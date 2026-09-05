@@ -1,5 +1,6 @@
 import { ConfigError, readConfig } from './config.js';
 import { createModelClient } from './model-client.js';
+import { initSessionContext } from './session-context.js';
 import { initTracing, shutdownTracing } from './tracing.js';
 import { createTokenProvider } from './yandex-auth.js';
 
@@ -25,6 +26,10 @@ async function main(): Promise<void> {
 
     console.log('\n1. Получение IAM-токена');
     initTracing(config.tracing);
+    const session = initSessionContext({
+        sessionId: config.tracing.sessionId,
+        userId: config.tracing.userId,
+    });
     const tokens = createTokenProvider(config.auth);
     const started = Date.now();
     const token = await tokens.getToken();

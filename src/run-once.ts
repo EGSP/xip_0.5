@@ -1,14 +1,15 @@
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
-import { runAgent, SYSTEM_PROMPT } from './agent-loop.js';
+import { runTurn, SYSTEM_PROMPT } from './agent-loop.js';
 import { ConfigError, readConfig } from './config.js';
 import { createModelClient } from './model-client.js';
-import { calls, iterations } from './plural.js';
+import { calls, steps } from './plural.js';
 import { createSessionLog, type SessionEvent } from './session-log.js';
+import { initSessionContext } from './session-context.js';
 import { initTracing, shutdownTracing } from './tracing.js';
 import { createTokenProvider } from './yandex-auth.js';
 
 /**
- * Один прогон без интерфейса: запрос берётся из аргументов командной строки, лента событий
+ * Один ход без интерфейса: запрос берётся из аргументов командной строки, лента событий
  * печатается обычным выводом. Нужен для проверки цикла там, где интерактивный ввод
  * недоступен (сценарии, конвейеры, автоматическая проверка).
  */
@@ -34,6 +35,13 @@ async function main(): Promise<void> {
     }
 
     initTracing(config.tracing);
+    const session = initSessionContext({
+        sessionId: config.tracing.sessionId,
+        userId: config.tracing.userId,
+    });
+    if (config.tracing.enabled) {
+        console.log(`  сессия: ${session.sessionId} · пользователь: ${session.userId}`);
+    }
     const model = createModelClient(config, createTokenProvider(config.auth));
     const log = createSessionLog(print);
 
@@ -44,17 +52,17 @@ async function main(): Promise<void> {
     log.append({ type: 'user_message', text: prompt });
 
     try {
-        await runAgent({
+        await runTurn({
             model,
             messages,
             log,
-            maxIterations: config.maxIterations,
+            maxSteps: config.maxSteps,
             toolResultMaxChars: config.toolResultMaxChars,
             captureContent: config.tracing.captureContent,
         });
     } catch (error) {
         console.error(
-            `\n[прогон не завершён] ${error instanceof Error ? error.message : String(error)}`,
+            `\n[ход не завершён] ${error instanceof Error ? error.message : String(error)}`,
         );
         process.exitCode = 1;
     }
@@ -73,6 +81,11 @@ function print(event: SessionEvent): void {
             break;
         case 'assistant_note':
             console.log(`\n  ✎ текст модели вместе с вызовами: ${event.text}`);
+            break;
+        case 'assistant_reasoning':
+            console.log(`
+  ⋯ рассуждение модели (${event.tokens} ток., ${event.text.length} символов):`);
+            console.log(`    ${event.text.slice(0, 600)}${event.text.length > 600 ? ' …' : ''}`);
             break;
         case 'tool_call': {
             if (event.batchSize > 1 && event.batchIndex === 1) {
@@ -94,15 +107,15 @@ function print(event: SessionEvent): void {
         case 'assistant_message':
             console.log(`\n${event.text}`);
             break;
-        case 'run_finished':
+        case 'turn_finished':
             console.log(
-                `\n  ${event.iterations} ${iterations(event.iterations)} · ` +
+                `\n  ${event.steps} ${steps(event.steps)} · ` +
                     `${event.toolCalls} ${calls(event.toolCalls)} · ` +
                     `${event.promptTokens}→${event.completionTokens} ток. · ` +
                     `${(event.durationMs / 1000).toFixed(1)} с\n`,
             );
             break;
-        case 'run_failed':
+        case 'turn_failed':
             console.log(`\n  ✖ ${event.reason}: ${event.message}\n`);
             break;
     }

@@ -55,7 +55,7 @@ export function initTracing(config: TracingConfig): void {
 
 /**
  * Дожидается отправки накопленных спанов. Вызывается при завершении программы: пакетный
- * обработчик копит спаны и без явного сброса последний прогон в коллектор не попадёт.
+ * обработчик копит спаны и без явного сброса последний ход в коллектор не попадёт.
  */
 export async function shutdownTracing(): Promise<void> {
     if (provider === undefined) return;

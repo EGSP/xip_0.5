@@ -6,6 +6,7 @@ import type {
 import type { ModelClient } from './model-client.js';
 import type { SessionLog } from './session-log.js';
 import { toolByName, toolSpecs, tools } from './tools.js';
+import { sessionAttributes } from './session-context.js';
 import { toolCallAttributes, toolResultAttributes } from './tracing-attributes.js';
 import { tracer } from './tracing.js';
 
@@ -20,56 +21,72 @@ export const SYSTEM_PROMPT = [
 ].join(' ');
 
 /**
- * Состояние текущего прогона для живой области интерфейса.
+ * Состояние текущего хода для живой области интерфейса.
  *
- * Прогон — одно исполнение цикла от сообщения пользователя до итогового ответа.
- * Итерация — один виток внутри прогона: обращение к модели плюс исполнение вызовов,
+ * Ход — одно исполнение цикла от сообщения пользователя до итогового ответа.
+ * Шаг — один виток внутри хода: обращение к модели плюс исполнение вызовов,
  * которые оно затребовало.
  */
-export type RunProgress =
-    | { readonly kind: 'model'; readonly iteration: number; readonly maxIterations: number }
+export type TurnProgress =
+    | { readonly kind: 'model'; readonly step: number; readonly maxSteps: number }
     | {
           readonly kind: 'tool';
-          readonly iteration: number;
-          readonly maxIterations: number;
+          readonly step: number;
+          readonly maxSteps: number;
           readonly name: string;
           readonly batchIndex: number;
           readonly batchSize: number;
       };
 
-export class IterationLimitError extends Error {
-    constructor(limit: number) {
+/**
+ * Модель израсходовала весь бюджет выходных токенов, не дойдя до ответа. У рассуждающих
+ * моделей это типичный исход: размышление занимает выход целиком, и `content` остаётся пуст.
+ * Отличается от прочих отказов тем, что чинится настройками, а не повтором.
+ */
+export class OutputLimitError extends Error {
+    constructor(completionTokens: number, hadReasoning: boolean) {
         super(
-            `Прогон остановлен: превышен предел в ${limit} итераций. Задача, вероятно, слишком ` +
-                'велика для одного прогона, либо модель зациклилась на одном инструменте.',
+            `Модель исчерпала бюджет выходных токенов (${completionTokens}), не сформировав ответ` +
+                (hadReasoning ? ': весь выход занял текст рассуждения.' : '.') +
+                ' Увеличьте AGENT_MAX_TOKENS, упростите запрос либо возьмите модель без режима рассуждения.',
         );
-        this.name = 'IterationLimitError';
+        this.name = 'OutputLimitError';
     }
 }
 
-export type RunAgentParams = {
+export class StepLimitError extends Error {
+    constructor(limit: number) {
+        super(
+            `Ход остановлен: превышен предел в ${limit} шагов. Задача, вероятно, слишком ` +
+                'велик для одного хода, либо модель зациклилась на одном инструменте.',
+        );
+        this.name = 'StepLimitError';
+    }
+}
+
+export type RunTurnParams = {
     readonly model: ModelClient;
-    /** Массив сообщений, отправляемый модели. Мутируется: прогон дописывает в него свои записи. */
+    /** Массив сообщений, отправляемый модели. Мутируется: ход дописывает в него свои записи. */
     readonly messages: ChatCompletionMessageParam[];
     readonly log: SessionLog;
-    readonly maxIterations: number;
+    readonly maxSteps: number;
     readonly toolResultMaxChars: number;
     /** Записывать ли в спаны аргументы и результаты вызовов. */
     readonly captureContent?: boolean;
-    readonly onProgress?: (progress: RunProgress) => void;
+    readonly onProgress?: (progress: TurnProgress) => void;
     readonly signal?: AbortSignal;
 };
 
 /**
- * Один прогон агентского цикла.
+ * Один ход агентского цикла.
  *
  * API модели не имеет памяти: каждое обращение отправляет весь массив сообщений заново.
  * Модель ничего не выполняет — она называет имя функции и аргументы, а выполняет программа,
- * кладёт результат в массив и отправляет массив снова. Прогон завершается, когда ответ
+ * кладёт результат в массив и отправляет массив снова. Ход завершается, когда ответ
  * модели не содержит требований вызова.
  */
-export async function runAgent(params: RunAgentParams): Promise<string> {
-    // Спан `invoke_agent` — весь прогон целиком; внутри него оказываются спаны обращений
+export async function runTurn(params: RunTurnParams): Promise<string> {
+    // Спан `invoke_agent` — весь ход целиком; внутри него оказываются спаны обращений
     // к модели и вызовов инструментов. Так в трассировке видно, из чего сложилось время
     // ответа: сколько заняла модель, сколько инструменты.
     // startActiveSpan, а не startSpan: спан помещается в текущий контекст, и вложенные
@@ -79,13 +96,14 @@ export async function runAgent(params: RunAgentParams): Promise<string> {
         'invoke_agent',
         {
             attributes: {
+                ...sessionAttributes(),
                 'gen_ai.operation.name': 'invoke_agent',
                 'openinference.span.kind': 'AGENT',
             },
         },
         async (span) => {
             try {
-                const result = await runInSpan(params, span);
+                const result = await runTurnBody(params, span);
                 span.setStatus({ code: SpanStatusCode.OK });
                 return result;
             } catch (error) {
@@ -102,12 +120,12 @@ export async function runAgent(params: RunAgentParams): Promise<string> {
     );
 }
 
-async function runInSpan(params: RunAgentParams, runSpan: Span): Promise<string> {
-    const { model, messages, log, maxIterations, toolResultMaxChars, onProgress, signal } = params;
+async function runTurnBody(params: RunTurnParams, runSpan: Span): Promise<string> {
+    const { model, messages, log, maxSteps, toolResultMaxChars, onProgress, signal } = params;
     const captureContent = params.captureContent ?? false;
 
-    // Запрос пользователя выносится на корневой спан: тогда в списке прогонов видно, о чём
-    // был прогон, без раскрытия дерева. Итоговый ответ ставится туда же при завершении.
+    // Запрос пользователя выносится на корневой спан: тогда в списке ходов видно, о чём
+    // был ход, без раскрытия дерева. Итоговый ответ ставится туда же при завершении.
     if (captureContent) {
         const lastUser = [...messages].reverse().find((message) => message.role === 'user');
         const text = typeof lastUser?.content === 'string' ? lastUser.content : '';
@@ -121,8 +139,8 @@ async function runInSpan(params: RunAgentParams, runSpan: Span): Promise<string>
     let completionTokens = 0;
     let toolCalls = 0;
 
-    for (let iteration = 1; iteration <= maxIterations; iteration++) {
-        onProgress?.({ kind: 'model', iteration, maxIterations });
+    for (let step = 1; step <= maxSteps; step++) {
+        onProgress?.({ kind: 'model', step, maxSteps });
 
         const reply = await model.complete(messages, toolSpecs, signal);
         promptTokens += reply.usage.prompt;
@@ -134,15 +152,32 @@ async function runInSpan(params: RunAgentParams, runSpan: Span): Promise<string>
         // сообщения с ролью "tool" привязаны к ним, и без них следующий запрос будет отвергнут.
         messages.push(message);
 
+        // Рассуждение журналируется, но в историю диалога не возвращается: модель не ждёт
+        // его обратно, а объём рассуждения способен превысить сам диалог.
+        if (reply.reasoning !== undefined) {
+            log.append({
+                type: 'assistant_reasoning',
+                step,
+                text: reply.reasoning,
+                tokens: reply.usage.completion,
+            });
+            delete (message as { reasoning_content?: unknown }).reasoning_content;
+        }
+
         const calls = message.tool_calls ?? [];
         const text = (message.content ?? '').trim();
 
-        // (б) Вызовов нет — модель ответила текстом, прогон закончен.
+        // Пустой ответ при `length` — не пустой ответ, а исчерпанный бюджет вывода.
+        if (calls.length === 0 && text === '' && reply.finishReason === 'length') {
+            throw new OutputLimitError(reply.usage.completion, reply.reasoning !== undefined);
+        }
+
+        // (б) Вызовов нет — модель ответила текстом, ход закончен.
         if (calls.length === 0) {
             log.append({ type: 'assistant_message', text });
             log.append({
-                type: 'run_finished',
-                iterations: iteration,
+                type: 'turn_finished',
+                steps: step,
                 toolCalls,
                 promptTokens,
                 completionTokens,
@@ -152,7 +187,7 @@ async function runInSpan(params: RunAgentParams, runSpan: Span): Promise<string>
                 runSpan.setAttributes({ 'output.value': text, 'output.mime_type': 'text/plain' });
             }
             runSpan.setAttributes({
-                'agent.iterations': iteration,
+                'agent.steps': step,
                 'agent.tool_calls': toolCalls,
                 'gen_ai.usage.input_tokens': promptTokens,
                 'gen_ai.usage.output_tokens': completionTokens,
@@ -163,7 +198,7 @@ async function runInSpan(params: RunAgentParams, runSpan: Span): Promise<string>
         // Поле content при вызовах необязательно. Если модель всё же что-то написала,
         // это отмечается отдельным событием: так видно, разговаривает ли она между вызовами.
         if (text !== '') {
-            log.append({ type: 'assistant_note', iteration, text });
+            log.append({ type: 'assistant_note', step, text });
         }
 
         // (в) Вызовы есть — выполняем каждый. Пропущенный результат сделает следующий запрос
@@ -187,14 +222,14 @@ async function runInSpan(params: RunAgentParams, runSpan: Span): Promise<string>
                 callId: call.id,
                 name: call.function.name,
                 rawArguments: call.function.arguments,
-                iteration,
+                step,
                 batchSize,
                 batchIndex,
             });
             onProgress?.({
                 kind: 'tool',
-                iteration,
-                maxIterations,
+                step,
+                maxSteps,
                 name: call.function.name,
                 batchIndex,
                 batchSize,
@@ -213,9 +248,13 @@ async function runInSpan(params: RunAgentParams, runSpan: Span): Promise<string>
             });
             const outcome = await executeCall(call);
             toolSpan.setAttributes(toolResultAttributes(outcome.content, captureContent));
-            if (!outcome.ok) {
-                toolSpan.setStatus({ code: SpanStatusCode.ERROR, message: 'инструмент вернул ошибку' });
-            }
+            // Статус выставляется явно в обоих исходах. По умолчанию у спана статус UNSET,
+            // и приёмник показывает его как «Unset» — это отсутствие суждения, а не успех.
+            toolSpan.setStatus(
+                outcome.ok
+                    ? { code: SpanStatusCode.OK }
+                    : { code: SpanStatusCode.ERROR, message: 'инструмент вернул ошибку' },
+            );
             toolSpan.end();
             const content = truncate(outcome.content, toolResultMaxChars);
 
@@ -235,15 +274,15 @@ async function runInSpan(params: RunAgentParams, runSpan: Span): Promise<string>
         }
     }
 
-    throw new IterationLimitError(maxIterations);
+    throw new StepLimitError(maxSteps);
 }
 
 type CallOutcome = { readonly ok: boolean; readonly content: string };
 
 /**
  * Исполняет один вызов. Ошибка инструмента — штатная ситуация, а не исключение: она
- * возвращается модели результатом вызова, чтобы та исправилась на следующей итерации.
- * Наверх пробрасывается только отмена прогона.
+ * возвращается модели результатом вызова, чтобы та исправилась на следующем шаге.
+ * Наверх пробрасывается только отмена хода.
  */
 async function executeCall(
     call: ChatCompletionMessageToolCall & { type: 'function' },
@@ -316,8 +355,8 @@ function describe(cause: unknown): string {
 
 /**
  * Ограничение размера результата. Без него один объёмный вывод занимает окно контекста
- * целиком, а поскольку каждая итерация отправляет всю историю заново, цена этого растёт
- * с каждой итерацией.
+ * целиком, а поскольку каждый шаг отправляет всю историю заново, цена этого растёт
+ * с каждым шагом.
  */
 function truncate(content: string, maxChars: number): string {
     if (content.length <= maxChars) return content;

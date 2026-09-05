@@ -1,7 +1,7 @@
 import type { ReactElement } from 'react';
 import { Box, Text } from 'ink';
-import { calls as callsNoun } from '../plural.js';
-import type { RunFailureReason, SessionEvent } from '../session-log.js';
+import { calls as callsNoun, steps as stepsNoun } from '../plural.js';
+import type { TurnFailureReason, SessionEvent } from '../session-log.js';
 
 /** Сжимает многострочное значение в одну строку и обрезает до предела. */
 function oneLine(value: string, limit: number): string {
@@ -34,9 +34,10 @@ function summariseResult(content: string, ok: boolean): string {
     return compactArgs(content) || oneLine(content, 96);
 }
 
-const failureLabel: Record<RunFailureReason, string> = {
+const failureLabel: Record<TurnFailureReason, string> = {
     model_error: 'ошибка модели',
-    iteration_limit: 'превышен предел итераций',
+    step_limit: 'превышен предел шагов',
+    output_limit: 'исчерпан бюджет вывода',
     aborted: 'прервано пользователем',
     internal: 'внутренняя ошибка',
 };
@@ -77,6 +78,17 @@ export function EventLine({ event }: { readonly event: SessionEvent }): ReactEle
                     <Text color="magenta">{`    ${oneLine(event.text, 400)}`}</Text>
                 </Box>
             );
+
+        case 'assistant_reasoning': {
+            const preview = oneLine(event.text, 300);
+            const tail = event.text.length > 300 ? ` … всего ${event.text.length} символов` : '';
+            return (
+                <Box marginTop={1} flexDirection="column">
+                    <Text color="blue" dimColor>{`  ⋯ рассуждение модели (${event.tokens} ток.)`}</Text>
+                    <Text color="blue" dimColor>{`    ${preview}${tail}`}</Text>
+                </Box>
+            );
+        }
 
         case 'tool_call': {
             const glyphs = branchGlyphs(event.batchSize, event.batchIndex);
@@ -122,21 +134,21 @@ export function EventLine({ event }: { readonly event: SessionEvent }): ReactEle
                 </Box>
             );
 
-        case 'run_finished':
+        case 'turn_finished':
             return (
                 <Box marginTop={1}>
                     <Text dimColor>
-                        {`  ${event.iterations} итер.  ·  ${event.toolCalls} ${callsNoun(event.toolCalls)}` +
+                        {`  ${event.steps} ${stepsNoun(event.steps)}  ·  ${event.toolCalls} ${callsNoun(event.toolCalls)}` +
                             `  ·  ${event.promptTokens}→${event.completionTokens} ток.` +
                             `  ·  ${formatDuration(event.durationMs)}`}
                     </Text>
                 </Box>
             );
 
-        case 'run_failed':
+        case 'turn_failed':
             return (
                 <Box marginTop={1} flexDirection="column">
-                    <Text color="red" bold>{`  ✖ прогон не завершён — ${failureLabel[event.reason]}`}</Text>
+                    <Text color="red" bold>{`  ✖ ход не завершён — ${failureLabel[event.reason]}`}</Text>
                     <Text color="red">{`    ${event.message}`}</Text>
                 </Box>
             );

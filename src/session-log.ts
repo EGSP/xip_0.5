@@ -11,12 +11,17 @@
  * не потому, что нужен сейчас, а потому, что привычка считать массив сообщений единственным
  * хранилищем формируется быстро, а переделка затрагивает весь написанный вокруг него код.
  *
- * Терминология: **прогон** — одно исполнение агентского цикла от сообщения пользователя до
- * итогового ответа; **итерация** — один виток внутри прогона: обращение к модели плюс
+ * Терминология: **ход** — одно исполнение агентского цикла от сообщения пользователя до
+ * итогового ответа; **шаг** — один виток внутри хода: обращение к модели плюс
  * исполнение вызовов, которые оно затребовало.
  */
 
-export type RunFailureReason = 'model_error' | 'iteration_limit' | 'aborted' | 'internal';
+export type TurnFailureReason =
+    | 'model_error'
+    | 'step_limit'
+    | 'output_limit'
+    | 'aborted'
+    | 'internal';
 
 export type SessionEvent =
     | { readonly seq: number; readonly at: Date; readonly type: 'user_message'; readonly text: string }
@@ -30,8 +35,20 @@ export type SessionEvent =
           readonly seq: number;
           readonly at: Date;
           readonly type: 'assistant_note';
-          readonly iteration: number;
+          readonly step: number;
           readonly text: string;
+      }
+    /**
+     * Текст рассуждения модели. Рассуждающие модели возвращают его отдельным полем; в историю
+     * диалога он не попадает, поэтому виден только здесь.
+     */
+    | {
+          readonly seq: number;
+          readonly at: Date;
+          readonly type: 'assistant_reasoning';
+          readonly step: number;
+          readonly text: string;
+          readonly tokens: number;
       }
     | {
           readonly seq: number;
@@ -40,7 +57,7 @@ export type SessionEvent =
           readonly callId: string;
           readonly name: string;
           readonly rawArguments: string;
-          readonly iteration: number;
+          readonly step: number;
           /** Сколько вызовов модель затребовала одним сообщением. */
           readonly batchSize: number;
           /** Порядковый номер вызова внутри этого сообщения, начиная с единицы. */
@@ -67,8 +84,8 @@ export type SessionEvent =
     | {
           readonly seq: number;
           readonly at: Date;
-          readonly type: 'run_finished';
-          readonly iterations: number;
+          readonly type: 'turn_finished';
+          readonly steps: number;
           readonly toolCalls: number;
           readonly promptTokens: number;
           readonly completionTokens: number;
@@ -77,8 +94,8 @@ export type SessionEvent =
     | {
           readonly seq: number;
           readonly at: Date;
-          readonly type: 'run_failed';
-          readonly reason: RunFailureReason;
+          readonly type: 'turn_failed';
+          readonly reason: TurnFailureReason;
           readonly message: string;
       };
 

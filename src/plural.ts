@@ -11,6 +11,6 @@ export function plural(count: number, one: string, few: string, many: string): s
 /** «вызов / вызова / вызовов» — самая частая форма в ленте событий. */
 export const calls = (count: number): string => plural(count, 'вызов', 'вызова', 'вызовов');
 
-/** «итерация / итерации / итераций». */
-export const iterations = (count: number): string =>
-    plural(count, 'итерация', 'итерации', 'итераций');
+/** «шаг / шага / шагов». */
+export const steps = (count: number): string =>
+    plural(count, 'шаг', 'шага', 'шагов');

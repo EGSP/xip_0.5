@@ -24,6 +24,19 @@ export type TokenUsage = { readonly prompt: number; readonly completion: number 
 export type ModelReply = {
     readonly message: ChatCompletionMessage;
     readonly usage: TokenUsage;
+    /**
+     * Текст рассуждения модели. Рассуждающие модели тратят часть выходного бюджета на
+     * размышление и возвращают его отдельным полем `reasoning_content`; в `content`
+     * попадает только итог. Стандартом OpenAI это поле не описано, но его отдают Yandex
+     * AI Studio, DeepSeek и большинство развёртываний Qwen.
+     */
+    readonly reasoning: string | undefined;
+    /**
+     * Причина остановки генерации. Значение `length` означает, что модель упёрлась в предел
+     * выходных токенов; при этом `content` может остаться пустым, если весь бюджет ушёл
+     * на рассуждение.
+     */
+    readonly finishReason: string | undefined;
 };
 
 export type ModelClient = {
@@ -79,8 +92,11 @@ export function createModelClient(config: AppConfig, tokens: TokenProvider): Mod
                         reply.usage.prompt,
                         reply.usage.completion,
                         config.tracing.captureContent,
+                        config.tracing.captureContent ? reply.reasoning : undefined,
+                        reply.finishReason,
                     ),
                 );
+                span.setStatus({ code: SpanStatusCode.OK });
                 return reply;
             } catch (error) {
                 span.recordException(error as Error);
@@ -111,6 +127,12 @@ export function createModelClient(config: AppConfig, tokens: TokenProvider): Mod
                             model: modelUri,
                             messages: messages as ChatCompletionMessageParam[],
                             temperature: config.temperature,
+                            // Предел выходных токенов. У рассуждающих моделей размышление
+                            // расходуется из того же бюджета, что и ответ, поэтому слишком
+                            // низкое значение приводит к пустому ответу.
+                            ...(config.maxTokens === undefined
+                                ? {}
+                                : { max_tokens: config.maxTokens }),
                             ...(tools.length > 0 ? { tools: tools as ChatCompletionTool[] } : {}),
                         },
                         {
@@ -135,12 +157,18 @@ export function createModelClient(config: AppConfig, tokens: TokenProvider): Mod
             throw new ModelError('Модель вернула ответ без вариантов (choices пуст)');
         }
 
+        // Поле `reasoning_content` не описано типами SDK: стандартом OpenAI оно не
+        // предусмотрено, но его возвращают Yandex AI Studio, DeepSeek и развёртывания Qwen.
+        const reasoning = (choice.message as { reasoning_content?: unknown }).reasoning_content;
+
         return {
             message: choice.message,
             usage: {
                 prompt: response.usage?.prompt_tokens ?? 0,
                 completion: response.usage?.completion_tokens ?? 0,
             },
+            reasoning: typeof reasoning === 'string' && reasoning !== '' ? reasoning : undefined,
+            finishReason: choice.finish_reason ?? undefined,
         };
     }
 }

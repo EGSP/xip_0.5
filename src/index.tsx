@@ -3,6 +3,7 @@ import { ConfigError, readConfig, type AppConfig } from './config.js';
 import { createModelClient } from './model-client.js';
 import { tools } from './tools.js';
 import { App } from './ui/App.js';
+import { initSessionContext } from './session-context.js';
 import { initTracing, shutdownTracing } from './tracing.js';
 import { createTokenProvider } from './yandex-auth.js';
 
@@ -29,17 +30,25 @@ function main(): void {
     }
 
     initTracing(config.tracing);
+    const session = initSessionContext({
+        sessionId: config.tracing.sessionId,
+        userId: config.tracing.userId,
+    });
 
     const tokens = createTokenProvider(config.auth);
     const model = createModelClient(config, tokens);
 
-    printHeader(config, model.modelUri);
+    printHeader(config, model.modelUri, session);
 
     const instance = render(<App model={model} config={config} />);
     void instance.waitUntilExit().then(shutdownTracing);
 }
 
-function printHeader(config: AppConfig, modelUri: string): void {
+function printHeader(
+    config: AppConfig,
+    modelUri: string,
+    session: { readonly sessionId: string; readonly userId: string },
+): void {
     const authKind =
         config.auth.kind === 'static'
             ? 'готовый IAM-токен'
@@ -53,8 +62,14 @@ function printHeader(config: AppConfig, modelUri: string): void {
             `  API:           ${config.baseUrl}`,
             `  авторизация:   ${authKind}`,
             `  инструменты:   ${tools.map((tool) => tool.name).join(', ')}`,
-            `  предел шагов:  ${config.maxIterations}`,
+            `  предел шагов:  ${config.maxSteps}`,
             `  каталог:       ${process.cwd()}`,
+            ...(config.tracing.enabled
+                ? [
+                      `  трассировка:   ${config.tracing.endpoint}`,
+                      `  сессия:        ${session.sessionId}  ·  пользователь: ${session.userId}`,
+                  ]
+                : []),
             '',
         ].join('\n'),
     );

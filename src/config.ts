@@ -5,7 +5,7 @@ loadDotenv();
 /** Базовый адрес OpenAI-совместимого API Yandex AI Studio (Chat Completions). */
 const DEFAULT_BASE_URL = 'https://llm.api.cloud.yandex.net/v1';
 
-const DEFAULT_MAX_ITERATIONS = 10;
+const DEFAULT_MAX_STEPS = 10;
 const DEFAULT_TEMPERATURE = 0.3;
 const DEFAULT_TOOL_RESULT_MAX_CHARS = 8000;
 
@@ -41,6 +41,16 @@ export type TracingConfig = {
      * должно быть противоположным: иначе пользовательский ввод уходит в коллектор.
      */
     readonly captureContent: boolean;
+    /**
+     * Идентификатор пользователя для телеметрии. Пусто — берётся имя машины с приставкой `l_`,
+     * обозначающей локальный запуск.
+     */
+    readonly userId: string;
+    /**
+     * Идентификатор сессии. Пусто — порождается при запуске. Задаётся явно, когда нужно
+     * объединить несколько запусков `npm run once` в одну сессию.
+     */
+    readonly sessionId: string;
 };
 
 export type AppConfig = {
@@ -50,8 +60,10 @@ export type AppConfig = {
     readonly folderId: string;
     readonly baseUrl: string;
     readonly auth: AuthConfig;
-    readonly maxIterations: number;
+    readonly maxSteps: number;
     readonly temperature: number;
+    /** Предел выходных токенов на одно обращение. Не задан — используется значение модели. */
+    readonly maxTokens: number | undefined;
     readonly toolResultMaxChars: number;
     readonly tracing: TracingConfig;
 };
@@ -132,7 +144,7 @@ export function readConfig(): AppConfig {
         );
     }
 
-    const maxIterations = readNumber('AGENT_MAX_ITERATIONS', DEFAULT_MAX_ITERATIONS, problems);
+    const maxSteps = readNumber('AGENT_MAX_STEPS', DEFAULT_MAX_STEPS, problems);
     const temperature = readNumber('AGENT_TEMPERATURE', DEFAULT_TEMPERATURE, problems);
     const toolResultMaxChars = readNumber(
         'TOOL_RESULT_MAX_CHARS',
@@ -140,8 +152,14 @@ export function readConfig(): AppConfig {
         problems,
     );
 
-    if (maxIterations < 1) {
-        problems.push('AGENT_MAX_ITERATIONS должен быть не меньше 1');
+    const maxTokensRaw = trimmed('AGENT_MAX_TOKENS');
+    const maxTokens = maxTokensRaw === '' ? undefined : Number(maxTokensRaw);
+    if (maxTokens !== undefined && (!Number.isFinite(maxTokens) || maxTokens < 1)) {
+        problems.push(`AGENT_MAX_TOKENS: ожидалось положительное число, получено "${maxTokensRaw}"`);
+    }
+
+    if (maxSteps < 1) {
+        problems.push('AGENT_MAX_STEPS должен быть не меньше 1');
     }
 
     if (problems.length > 0 || auth === undefined) {
@@ -158,14 +176,17 @@ export function readConfig(): AppConfig {
         folderId,
         baseUrl: baseUrlRaw === '' ? DEFAULT_BASE_URL : baseUrlRaw,
         auth,
-        maxIterations,
+        maxSteps,
         temperature,
+        maxTokens,
         toolResultMaxChars,
         tracing: {
             enabled: otlpEndpoint !== '',
             endpoint: otlpEndpoint,
             serviceName: serviceNameRaw === '' ? 'xip-0.5' : serviceNameRaw,
             captureContent: captureRaw !== 'false' && captureRaw !== '0',
+            userId: trimmed('AGENT_USER_ID'),
+            sessionId: trimmed('AGENT_SESSION_ID'),
         },
     };
 }

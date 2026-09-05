@@ -4,6 +4,7 @@ import type {
     ChatCompletionMessageParam,
     ChatCompletionTool,
 } from 'openai/resources/chat/completions';
+import { sessionAttributes } from './session-context.js';
 
 /**
  * Атрибуты спанов в двух наборах соглашений сразу.
@@ -46,6 +47,7 @@ export function chatRequestAttributes(
     captureContent: boolean,
 ): Attributes {
     const attributes: Attributes = {
+        ...sessionAttributes(),
         // OpenTelemetry GenAI
         'gen_ai.operation.name': 'chat',
         'gen_ai.system': 'yandex',
@@ -70,7 +72,7 @@ export function chatRequestAttributes(
         const text = contentOf(message);
         if (text !== '') attributes[`${prefix}.content`] = text;
 
-        // Вызовы инструментов, затребованные моделью на прошлой итерации.
+        // Вызовы инструментов, затребованные моделью на прошлом шаге.
         const toolCalls = (message as { tool_calls?: readonly unknown[] }).tool_calls;
         if (Array.isArray(toolCalls)) {
             toolCalls.forEach((call, callIndex) => {
@@ -96,6 +98,8 @@ export function chatResponseAttributes(
     promptTokens: number,
     completionTokens: number,
     captureContent: boolean,
+    reasoning?: string | undefined,
+    finishReason?: string | undefined,
 ): Attributes {
     const attributes: Attributes = {
         'gen_ai.usage.input_tokens': promptTokens,
@@ -104,6 +108,7 @@ export function chatResponseAttributes(
         'llm.token_count.prompt': promptTokens,
         'llm.token_count.completion': completionTokens,
         'llm.token_count.total': promptTokens + completionTokens,
+        ...(finishReason === undefined ? {} : { 'gen_ai.response.finish_reasons': [finishReason] }),
     };
 
     if (!captureContent) return attributes;
@@ -111,8 +116,25 @@ export function chatResponseAttributes(
     attributes['output.value'] = JSON.stringify(message);
     attributes['output.mime_type'] = 'application/json';
     attributes['llm.output_messages.0.message.role'] = 'assistant';
-    if (message.content !== null && message.content !== '') {
-        attributes['llm.output_messages.0.message.content'] = message.content;
+    if (finishReason !== undefined) {
+        attributes['llm.output_messages.0.message.finish_reason'] = finishReason;
+    }
+
+    const text = message.content ?? '';
+
+    if (reasoning !== undefined) {
+        // Сообщение с рассуждением раскладывается на части. Приёмник показывает часть с типом
+        // `reasoning` отдельным блоком в виде переписки; при этом `message.content` выставлять
+        // нельзя — иначе текст ответа отобразится дважды.
+        const parts = `llm.output_messages.0.message.contents`;
+        attributes[`${parts}.0.message_content.type`] = 'reasoning';
+        attributes[`${parts}.0.message_content.text`] = reasoning;
+        if (text !== '') {
+            attributes[`${parts}.1.message_content.type`] = 'text';
+            attributes[`${parts}.1.message_content.text`] = text;
+        }
+    } else if (text !== '') {
+        attributes['llm.output_messages.0.message.content'] = text;
     }
     message.tool_calls?.forEach((call, index) => {
         if (call.type !== 'function') return;
@@ -121,6 +143,14 @@ export function chatResponseAttributes(
         attributes[`${prefix}.function.name`] = call.function.name;
         attributes[`${prefix}.function.arguments`] = call.function.arguments;
     });
+
+    if (reasoning !== undefined) {
+        // Стандартного имени для текста рассуждения нет ни в одном из наборов соглашений,
+        // поэтому кладём его под собственным ключом; в интерфейсе приёмника он виден
+        // в перечне атрибутов спана.
+        // Дублируется плоским ключом: его читают приёмники, не понимающие раскладку на части.
+        attributes['gen_ai.completion.reasoning'] = reasoning.slice(0, 16000);
+    }
 
     return attributes;
 }
@@ -135,6 +165,7 @@ export function toolCallAttributes(
     captureContent: boolean,
 ): Attributes {
     const attributes: Attributes = {
+        ...sessionAttributes(),
         'gen_ai.operation.name': 'execute_tool',
         'gen_ai.tool.name': name,
         'gen_ai.tool.call.id': callId,
